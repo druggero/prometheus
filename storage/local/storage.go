@@ -1110,48 +1110,46 @@ func (s *MemorySeriesStorage) handleEvictList() {
 	}
 }
 
-// decPersistUrgency reduces the raw int urgency score by 1. This is used whenever
-// the score should be reduced. Instead of reducing it to the target value right
-// ahead (which is often 0, as heap size is quite noisy), we only reduce it by 1
-// so that we get a gradual drop. With an evictInterval of 1s, it takes about
-// 15m to drop from 1 to 0. This method must only be called by maybeEvict.
-func (s *MemorySeriesStorage) decPersistUrgency() {
-	if atomic.LoadInt32(&s.persistUrgency) > 0 {
-		// This is not a race as only one goroutine ever
-		// modifies the urgency score.
-		atomic.AddInt32(&s.persistUrgency, -1)
-	}
-}
-
 // maybeEvict is a local helper method. Must only be called by handleEvictList.
 func (s *MemorySeriesStorage) maybeEvict() {
 	var (
-		ms         runtime.MemStats
-		newUrgency int32 = 1000
+		ms                 runtime.MemStats
+		oldUrgency         = atomic.LoadInt32(&s.persistUrgency)
+		newUrgency         int32
+		numChunksToPersist = s.getNumChunksToPersist()
 	)
+	defer func() {
+		atomic.StoreInt32(&s.persistUrgency, newUrgency)
+	}()
+
 	runtime.ReadMemStats(&ms)
 
-	numChunksToEvict := (int(ms.NextGC) - s.targetHeapSize) / chunk.ChunkLen
-	if numChunksToEvict <= 0 {
-		s.decPersistUrgency()
-		return
+	if numChunksToPersist != 0 {
+		newUrgency = int32(numChunksToPersist * 1000 / (numChunksToPersist + s.evictList.Len()))
 	}
 
 	// Only continue if a GC has happened since we were here last time.
 	if ms.NumGC == s.lastNumGC {
+		if oldUrgency > newUrgency {
+			// Never reduce urgency without a GC run.
+			newUrgency = oldUrgency
+		}
 		return
 	}
 	s.lastNumGC = ms.NumGC
 
+	numChunksToEvict := (int(ms.NextGC) - s.targetHeapSize) / chunk.ChunkLen
+	if numChunksToEvict <= 0 {
+		return
+	}
+
 	if numChunksToEvict < s.evictList.Len() {
-		newUrgency = int32(numChunksToEvict * 1000 / s.evictList.Len())
+		if u := int32(numChunksToEvict * 1000 / s.evictList.Len()); u > newUrgency {
+			newUrgency = u
+		}
 	} else {
 		numChunksToEvict = s.evictList.Len()
-	}
-	if newUrgency < atomic.LoadInt32(&s.persistUrgency) {
-		s.decPersistUrgency()
-	} else {
-		atomic.StoreInt32(&s.persistUrgency, newUrgency)
+		newUrgency = 1000
 	}
 	if numChunksToEvict <= 0 {
 		return
@@ -1654,13 +1652,24 @@ func (s *MemorySeriesStorage) incNumChunksToPersist(by int) {
 // getPersistenceUrgencyScore returns an urgency score for the speed of
 // persisting chunks. The score is between 0 and 1, where 0 means no urgency at
 // all and 1 means highest urgency. It also returns if the storage is in
-// "rushed" mode. Should the score ever hit
-// persintenceUrgencyScoreForEnteringRushedMode, the storage locks into "rushed
-// mode" until the score is below
-// persintenceUrgencyScoreForLeavingRushedMode. Rushed mode plays a role for the
-// adaptive series-sync-strategy. It also switches off early checkpointing (due
-// to dirty series), and it makes series maintenance happen as quickly as
-// possible.
+// "rushed" mode.
+//
+// The persistenc urgency score is the maximum of the following two ratios:
+//
+// (1) The number of chunks waiting for persistence divided by the sum of the
+// number of chunks waiting for persistence and the number of chunks currently
+// evictable.
+//
+// (2) The number of chunks the storage was required to evict in the last
+// eviction run divided by the number of chunks that were evictable at that
+// time.
+//
+// Should the score exceed persintenceUrgencyScoreForEnteringRushedMode while
+// this method is called, the storage locks into "rushed mode" until the score
+// is below persintenceUrgencyScoreForLeavingRushedMode during a later call of
+// this method. Rushed mode plays a role for the adaptive
+// series-sync-strategy. It also switches off early checkpointing (due to dirty
+// series), and it makes series maintenance happen as quickly as possible.
 //
 // It is safe to call this method concurrently.
 func (s *MemorySeriesStorage) getPersistenceUrgencyScore() (float64, bool) {
